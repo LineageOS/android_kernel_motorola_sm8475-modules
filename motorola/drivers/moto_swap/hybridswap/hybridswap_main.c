@@ -10,20 +10,14 @@
 #include <linux/pagemap.h>
 #include <trace/hooks/mm.h>
 #include <trace/hooks/vmscan.h>
-#include <linux/genhd.h>
 #include <linux/proc_fs.h>
 #include <linux/swap.h>
 #include <linux/version.h>
 
-#ifdef CONFIG_ZRAM_5_4
-#include "../zram-5.4/zram_drv.h"
-#include "../zram-5.4/zram_drv_internal.h"
-#define MEMCG_OEM_DATA(memcg) ((memcg)->android_oem_data1)
-#elif defined CONFIG_ZRAM_5_15
-#include "../zram-5.15/zram_drv.h"
-#include "../zram-5.15/zram_drv_internal.h"
-#define BIO_MAX_PAGES BIO_MAX_VECS
-#define MEMCG_OEM_DATA(memcg) ((memcg)->android_oem_data1[0])
+#include "hybridswap_internal.h"
+#include "hybridswap.h"
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0) && LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
 static unsigned long memcg_page_state_local(struct mem_cgroup *memcg, int idx)
 {
 	long x = 0;
@@ -37,15 +31,7 @@ static unsigned long memcg_page_state_local(struct mem_cgroup *memcg, int idx)
 #endif
 	return x;
 }
-#else
-#include "../zram-5.10/zram_drv.h"
-#include "../zram-5.10/zram_drv_internal.h"
-#define MEMCG_OEM_DATA(memcg) ((memcg)->android_oem_data1)
 #endif
-#include "hybridswap_internal.h"
-#include "hybridswap.h"
-
-
 
 static const char *swapd_text[NR_EVENT_ITEMS] = {
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
@@ -62,13 +48,6 @@ static const char *swapd_text[NR_EVENT_ITEMS] = {
 	"swapd_snapshot_times",
 	"swapd_skip_shrink_of_window",
 	"swapd_manual_pause",
-#ifdef CONFIG_OPLUS_JANK
-	"swapd_cpu_busy_skip_times",
-	"swapd_cpu_busy_break_times",
-#endif
-#endif
-#ifdef CONFIG_HYBRIDSWAP_ASYNC_COMPRESS
-	"akcompressd_running",
 #endif
 };
 
@@ -89,10 +68,17 @@ static bool hybridswap_enabled = false;
 DEFINE_MUTEX(reclaim_para_lock);
 DEFINE_PER_CPU(struct swapd_event_state, swapd_event_states);
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+extern unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
+		unsigned long nr_pages,
+		gfp_t gfp_mask,
+		unsigned int reclaim_options);
+#else
 extern unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 		unsigned long nr_pages,
 		gfp_t gfp_mask,
 		bool may_swap);
+#endif
 
 void hybridswap_loglevel_set(int level)
 {
@@ -106,19 +92,6 @@ int hybridswap_loglevel(void)
 
 void __put_memcg_cache(memcg_hybs_t *hybs)
 {
-#ifdef CONFIG_HYBRIDSWAP_ASYNC_COMPRESS
-	if (hybs->cache.id > 0) {
-		spin_lock(&cached_idr_lock);
-		idr_replace(&cached_idr, NULL, hybs->cache.id);
-		idr_remove(&cached_idr, hybs->cache.id);
-		spin_unlock(&cached_idr_lock);
-	}
-
-	spin_lock(&hybs->cache.lock);
-	if (hybs->cache.dead != 1)
-		BUG();
-	spin_unlock(&hybs->cache.lock);
-#endif
 	kmem_cache_free(hybridswap_cache, (void *)hybs);
 }
 
@@ -230,23 +203,6 @@ memcg_hybs_t *hybridswap_cache_alloc(struct mem_cgroup *memcg, bool atomic)
 	if (!hybs)
 		return NULL;
 
-#ifdef CONFIG_HYBRIDSWAP_ASYNC_COMPRESS
-	spin_lock_init(&hybs->cache.lock);
-	INIT_LIST_HEAD(&hybs->cache.head);
-	hybs->cache.cnt = 0;
-	hybs->cache.compressing = 0;
-	hybs->cache.dead = 0;
-	spin_lock(&cached_idr_lock);
-	hybs->cache.id = idr_alloc(&cached_idr, NULL, 1, MEM_CGROUP_ID_MAX,
-			GFP_KERNEL);
-	if (hybs->cache.id < 0) {
-		spin_unlock(&cached_idr_lock);
-		kmem_cache_free(hybridswap_cache, (void*)hybs);
-		return NULL;
-	}
-	idr_replace(&cached_idr, &hybs->cache, hybs->cache.id);
-	spin_unlock(&cached_idr_lock);
-#endif
 	INIT_LIST_HEAD(&hybs->grade_node);
 #ifdef CONFIG_HYBRIDSWAP_CORE
 	spin_lock_init(&hybs->zram_init_lock);
@@ -263,9 +219,6 @@ memcg_hybs_t *hybridswap_cache_alloc(struct mem_cgroup *memcg, bool atomic)
 
 	ret = atomic64_cmpxchg((atomic64_t *)&MEMCG_OEM_DATA(memcg), 0, (u64)hybs);
 	if (ret != 0) {
-#ifdef CONFIG_HYBRIDSWAP_ASYNC_COMPRESS
-		hybs->cache.dead = 1;
-#endif
 		put_memcg_cache(hybs);
 		return (memcg_hybs_t *)ret;
 	}
@@ -274,7 +227,11 @@ memcg_hybs_t *hybridswap_cache_alloc(struct mem_cgroup *memcg, bool atomic)
 }
 
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+static void tune_scan_type_hook(void *data, enum scan_balance *scan_balance)
+#else
 static void tune_scan_type_hook(void *data, char *scan_balance)
+#endif
 {
 	/*hybrid swapd,scan anon only*/
 	if (current_is_mswapd()) {
@@ -330,9 +287,6 @@ static void mem_cgroup_free_hook(void *data, struct mem_cgroup *memcg)
 
 	hybs = (memcg_hybs_t *)MEMCG_OEM_DATA(memcg);
 	MEMCG_OEM_DATA(memcg) = 0;
-#ifdef CONFIG_HYBRIDSWAP_ASYNC_COMPRESS
-	clear_page_memcg(&hybs->cache);
-#endif
 	put_memcg_cache(hybs);
 }
 
@@ -405,8 +359,14 @@ static int register_all_hooks(void)
 	/* mem_cgroup_css_offline_hook */
 	REGISTER_HOOK(mem_cgroup_css_offline);
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
+	/* For GKI reason we use alloc_pages_slowpath_hook rather than rmqueue_hook. Both are fine. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	/* alloc_pages_slowpath_hook */
+	REGISTER_HOOK(alloc_pages_slowpath);
+#else
 	/* rmqueue_hook */
 	REGISTER_HOOK(rmqueue);
+#endif
 	/* tune_scan_type_hook */
 	REGISTER_HOOK(tune_scan_type);
 #endif
@@ -427,8 +387,13 @@ ERROR_OUT(tune_swappiness):
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
 	UNREGISTER_HOOK(tune_scan_type);
 ERROR_OUT(tune_scan_type):
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	UNREGISTER_HOOK(alloc_pages_slowpath);
+ERROR_OUT(alloc_pages_slowpath):
+#else
 	UNREGISTER_HOOK(rmqueue);
 ERROR_OUT(rmqueue):
+#endif
 #endif
 	UNREGISTER_HOOK(mem_cgroup_css_offline);
 ERROR_OUT(mem_cgroup_css_offline):
@@ -451,7 +416,11 @@ static void unregister_all_hook(void)
 	UNREGISTER_HOOK(mem_cgroup_id_remove);
 #endif
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	UNREGISTER_HOOK(alloc_pages_slowpath);
+#else
 	UNREGISTER_HOOK(rmqueue);
+#endif
 	UNREGISTER_HOOK(tune_scan_type);
 #endif
 	UNREGISTER_HOOK(tune_swappiness);
@@ -459,14 +428,27 @@ static void unregister_all_hook(void)
 
 unsigned long memcg_anon_pages(struct mem_cgroup *memcg)
 {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0) || LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 	struct lruvec *lruvec = NULL;
 	struct mem_cgroup_per_node *mz = NULL;
 #endif
 	if (!memcg)
 		return 0;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	mz = memcg->nodeinfo[0];
+	if (!mz)
+		return 0;
+	lruvec = &mz->lruvec;
+	if (!lruvec)
+		return 0;
+
+	return (lruvec_page_state(lruvec, NR_ACTIVE_ANON) +
+			lruvec_page_state(lruvec, NR_INACTIVE_ANON));
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+	return (memcg_page_state_local(memcg, NR_ACTIVE_ANON) +
+			memcg_page_state_local(memcg, NR_INACTIVE_ANON));
+#elif  LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
 	mz = mem_cgroup_nodeinfo(memcg, 0);
 	if (!mz) {
 		fetch_next_memcg_break(memcg);
@@ -478,32 +460,32 @@ unsigned long memcg_anon_pages(struct mem_cgroup *memcg)
 		fetch_next_memcg_break(memcg);
 		return 0;
 	}
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
-	return (mem_cgroup_fetch_lru_size(lruvec, LRU_ACTIVE_ANON) +
-			mem_cgroup_fetch_lru_size(lruvec, LRU_INACTIVE_ANON));
-#else
 	return (lruvec_page_state(lruvec, NR_ACTIVE_ANON) +
 			lruvec_page_state(lruvec, NR_INACTIVE_ANON));
-#endif
-
-#else
-	return (memcg_page_state_local(memcg, NR_ACTIVE_ANON) +
-			memcg_page_state_local(memcg, NR_INACTIVE_ANON));
 #endif
 }
 
 static unsigned long memcg_inactive_anon_pages(struct mem_cgroup *memcg)
 {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0) || LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 	struct lruvec *lruvec = NULL;
 	struct mem_cgroup_per_node *mz = NULL;
 #endif
-
 	if (!memcg)
 		return 0;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	mz = memcg->nodeinfo[0];
+	if (!mz)
+		return 0;
+	lruvec = &mz->lruvec;
+	if (!lruvec)
+		return 0;
+
+	return lruvec_page_state(lruvec, NR_INACTIVE_ANON);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+	return memcg_page_state_local(memcg, NR_INACTIVE_ANON);
+#elif  LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
 	mz = mem_cgroup_nodeinfo(memcg, 0);
 	if (!mz) {
 		fetch_next_memcg_break(memcg);
@@ -515,14 +497,7 @@ static unsigned long memcg_inactive_anon_pages(struct mem_cgroup *memcg)
 		fetch_next_memcg_break(memcg);
 		return 0;
 	}
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
-	return mem_cgroup_fetch_lru_size(lruvec, LRU_INACTIVE_ANON);
-#else
 	return lruvec_page_state(lruvec, NR_INACTIVE_ANON);
-#endif
-#else
-	return memcg_page_state_local(memcg, NR_INACTIVE_ANON);
 #endif
 }
 
@@ -547,10 +522,15 @@ static ssize_t mem_cgroup_force_shrink_anon(struct kernfs_open_file *of,
 	else
 		nr_need_reclaim = memcg_inactive_anon_pages(memcg);
 
-	hybp(HYB_INFO, "FORCE SHRINK +\n");
+	hybp(HYB_DEBUG, "FORCE SHRINK +\n");
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	nr_reclaimed = try_to_free_mem_cgroup_pages(memcg, nr_need_reclaim,
+			GFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP);
+#else
 	nr_reclaimed = try_to_free_mem_cgroup_pages(memcg, nr_need_reclaim,
 			GFP_KERNEL, true);
-	hybp(HYB_INFO, "FORCE SHRINK - to_reclaim %lu reclaimed %lu\n", nr_need_reclaim, nr_reclaimed);
+#endif
+	hybp(HYB_DEBUG, "FORCE SHRINK - to_reclaim %lu reclaimed %lu\n", nr_need_reclaim, nr_reclaimed);
 	return nbytes;
 }
 
@@ -924,12 +904,6 @@ static int hybridswap_enable(struct zram *zram)
 		return ret;
 #endif
 
-#ifdef CONFIG_HYBRIDSWAP_ASYNC_COMPRESS
-	ret = create_akcompressd_task(zram);
-	if (ret)
-		goto create_akcompressd_task_fail;
-#endif
-
 #ifdef CONFIG_HYBRIDSWAP_CORE
 	ret = hybridswap_core_enable();
 	if (ret)
@@ -941,10 +915,6 @@ static int hybridswap_enable(struct zram *zram)
 
 #ifdef CONFIG_HYBRIDSWAP_CORE
 hybridswap_core_enable_fail:
-#endif
-#ifdef CONFIG_HYBRIDSWAP_ASYNC_COMPRESS
-	destroy_akcompressd_task(zram);
-create_akcompressd_task_fail:
 #endif
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
 	swapd_exit();
@@ -961,10 +931,6 @@ static void hybridswap_disable(struct zram * zram)
 
 #ifdef CONFIG_HYBRIDSWAP_CORE
 	hybridswap_core_disable();
-#endif
-
-#ifdef CONFIG_HYBRIDSWAP_ASYNC_COMPRESS
-	destroy_akcompressd_task(zram);
 #endif
 
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
@@ -1045,10 +1011,6 @@ int __init hybridswap_pre_init(void)
 	}
 #endif
 
-#ifdef CONFIG_HYBRIDSWAP_ASYNC_COMPRESS
-	akcompressd_pre_init();
-#endif
-
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
 	swapd_pre_init();
 #endif
@@ -1062,9 +1024,6 @@ int __init hybridswap_pre_init(void)
 fail_out:
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
 	swapd_pre_deinit();
-#endif
-#ifdef CONFIG_HYBRIDSWAP_ASYNC_COMPRESS
-	akcompressd_pre_deinit();
 #endif
 error_out:
 	if (hybridswap_cache) {
@@ -1080,9 +1039,6 @@ void __exit hybridswap_exit(void)
 
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
 	swapd_pre_deinit();
-#endif
-#ifdef CONFIG_HYBRIDSWAP_ASYNC_COMPRESS
-	akcompressd_pre_deinit();
 #endif
 
 	if (hybridswap_cache) {
