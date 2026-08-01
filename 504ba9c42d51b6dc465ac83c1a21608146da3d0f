@@ -1,0 +1,21 @@
+{
+  "comments": [
+    {
+      "unresolved": false,
+      "key": {
+        "uuid": "3428dc61_40ce46ec",
+        "filename": "/PATCHSET_LEVEL",
+        "patchSetId": 1
+      },
+      "lineNbr": 0,
+      "author": {
+        "id": 14010
+      },
+      "writtenOn": "2026-08-01T11:11:18Z",
+      "side": 1,
+      "message": "On eqs I am hitting the same issue I had recently observed on ingot: https://review.lineageos.org/c/LineageOS/android_kernel_osom_sm8475-modules/+/494346\n\nPerhaps most/all sm8475 devices are affected.",
+      "revId": "504ba9c42d51b6dc465ac83c1a21608146da3d0f",
+      "serverId": "1ec6b3db-b2c1-4fa4-84a2-4c7efe89ba71"
+    }
+  ]
+}
