@@ -1,0 +1,21 @@
+{
+  "comments": [
+    {
+      "unresolved": false,
+      "key": {
+        "uuid": "b7ba9c8a_d7af449c",
+        "filename": "/PATCHSET_LEVEL",
+        "patchSetId": 1
+      },
+      "lineNbr": 0,
+      "author": {
+        "id": 19252
+      },
+      "writtenOn": "2026-09-29T05:24:09Z",
+      "side": 1,
+      "message": "this fixes sx937x building for hiphi, otherwise it\u0027ll fail to find base.h",
+      "revId": "df33355a77a8099e95c2e493d4a6a9b216f390fd",
+      "serverId": "1ec6b3db-b2c1-4fa4-84a2-4c7efe89ba71"
+    }
+  ]
+}
